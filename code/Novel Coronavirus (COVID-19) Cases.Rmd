@@ -1,0 +1,301 @@
+---
+title: 'Novel Coronavirus (COVID-19) Cases in China: Past, Present, and Future'
+date: "6/14/2021"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Coronavirus disease (COVID-19) is an infectious disease caused by a newly discovered coronavirus. Most people who fall sick with COVID-19 will experience mild to moderate symptoms and recover without special treatment. I import, tidy and analyze the COVID19 dataset from the Johns Hopkins github site. COVID-19 Data Repository by the Center for Systems Science and Engineering (CSSE) at Johns Hopkins University includes a complete list of all sources ever used in the data set, since January 21, 2010, for example, World Health Organization (WHO), European Center for Disease Prevention and Control (ECDC), and BNO News etc. This is a global pandemic problem and the governments across the globe are still trying hard to overcome and prevent the spread of COVID-19. Today, I will focus on my analysis in China and demonstrate several key insights derived from the COVID-19 data. 
+
+## Research Questions
+
+1. Which province in China has the most COVID-19 deaths? What's the best way to visually represent the information?
+2. Which province in China has the most impressive COVID-19 recovery rate? Is there any reason for such a bounce back?
+3. How do COVID-19 cases evolve over time in different China provinces? What should policymakers do to address such issue?
+4. Can policymakers predict the number of COVID-19 deaths (t+1) in Hubei based on the historical data CSSE collected?
+
+## Step 0: Import Library
+
+```{r library, message=FALSE, warning=FALSE, include=FALSE}
+# install.packages("tidyverse")
+# install.packages("prophet")
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(tidyr)
+library(prophet)
+```
+
+```{r}
+# Special functions
+applySum <- function(df, ...) {
+  assertthat::assert_that(...length() > 0, msg = "one or more column indexes are required")
+  mutate(df, Sum = apply(as.data.frame(df[, c(...)]), 1, sum))
+}
+
+# Force R not to use exponential notation (e.g. e+10)
+options(scipen = 999)
+```
+
+
+## Step 1: Load Data
+
+* `read_csv()` reads comma delimited files, read_csv2() reads semicolon separated files (common in countries where , is used as the decimal place), read_tsv() reads tab delimited files, and read_delim() reads in files with any delimiter.
+* `glimpse()` gets a glimpse of your data.
+
+```{r message=FALSE, warning=FALSE}
+# Get the main directory for URLs
+url_in <- "https://github.com/CSSEGISandData/COVID-19/raw/master/csse_covid_19_data/csse_covid_19_time_series/"
+file_names <- c("time_series_covid19_confirmed_global.csv",
+                "time_series_covid19_deaths_global.csv",
+                "time_series_covid19_recovered_global.csv")
+urls <- str_c(url_in, file_names)
+urls
+```
+
+```{r}
+# Load data into R
+global_cases <- read_csv(urls[1]) 
+global_deaths <- read_csv(urls[2]) 
+global_recovery <- read_csv(urls[3]) 
+```
+
+## Step 2: Tidy and Transform Data
+
+The key activities in this step are:
+
+1. Filter only rows related to China according to proposed research questions.
+2. Remove missing values from the data (NULL, NA, Unknown.)
+3. Summarize the COVID-19 cases, deaths, and recovery by province/state in China.
+4. Check the data type after data preprocessing.
+5. Identify extreme values with summary statistics.
+6. Gather to unpivot data to a long format for Heatmap visualization.
+
+```{r}
+# Filter only rows related to China
+# Remove missing values from the data (NULL, NA, Unknown.)
+# Summarize the COVID-19 cases, deaths, and recovery by province/state in China.
+china_cases = global_cases %>% 
+  filter(`Country/Region` == "China") %>%
+  drop_na() %>%
+  applySum(5:515) %>%
+  select(1:4, 516) %>%
+  rename(total_cases = Sum)
+
+china_deaths = global_deaths %>% 
+  filter(`Country/Region` == "China") %>%
+  drop_na() %>%
+  applySum(5:515) %>%
+  select(1:4, 516) %>%
+  rename(total_deaths = Sum)
+
+china_recover = global_recovery %>% 
+  filter(`Country/Region` == "China") %>% 
+  drop_na() %>%
+  applySum(5:515) %>%
+  select(1:4, 516) %>%
+  rename(total_recovery = Sum)
+```
+
+```{r}
+# Get a glimpse of China COVID-19 cases
+glimpse(china_cases)
+summary(china_cases)
+```
+```{r}
+# Get a glimpse of China COVID-19 deaths
+glimpse(china_deaths)
+summary(china_deaths)
+```
+
+```{r}
+# Get a glimpse of China COVID-19 recoveries
+glimpse(china_recover)
+summary(china_recover)
+```
+The summary statistics shows that of all the three datasets, the maximum value is far greater than the mean and minimum value in the total COVID-19 cases, deaths, and recovery by province/state in China. 
+
+```{r}
+# Sort and show top 5 provinces with total COVID-19 cases
+china_cases %>%
+  arrange(desc(total_cases)) %>%
+  head(5)
+```
+
+Last but not least, for Heatmap purpose, I gather to unpivot data to a long format, a critical step in getting to the answer towards the research question #3. I aggregate the data by month and year for visualizing the evolution of COVID-19 cases in a more convenient way.
+
+```{r}
+china_cases_long <- global_cases %>% 
+  filter(`Country/Region` == "China") %>%
+  drop_na() %>%
+  select(-2:-4) %>%
+  gather(key = date,
+         value = cases,
+         `1/22/20`:`6/15/21`) %>%
+  mutate(date = mdy(date),
+         month = month(date, label = TRUE), 
+         year = year(date)) %>%
+  group_by(`Province/State`, year) %>%
+  summarise(total_cases = sum(cases)) %>%
+  mutate(year = as.factor(year))
+head(china_cases_long)
+```
+In an attempt to answering research question #4, I prepare the data for modelling purpose below: 
+
+```{r}
+china_deaths_ts = global_deaths %>% 
+  filter(`Country/Region` == "China") %>%
+  drop_na() %>%
+  select(-2:-4) %>%
+  gather(key = date,
+         value = cases,
+         `1/22/20`:`6/15/21`) %>%
+  mutate(date = mdy(date),
+         month = month(date, label = TRUE), 
+         year = year(date)) %>%
+  filter(`Province/State` == "Hubei") %>%
+  select(date, cases) %>%
+  rename(ds = date, y = cases)
+head(china_deaths_ts)
+```
+
+
+## Step 3: Add Visualizations and Analysis
+
+1. Which province in China has the most COVID-19 deaths? What's the best way to visually represent the information?
+
+Apparently, Hubei stands out to contract the most COVID-19 deaths...2,109,308 are dead due to COVID-19. This is a very concerning situation and policymakers need to investigate this issue as soon as possible! Hong Kong and Henan are placed 2nd and 3rd respectively in the number of COVID-19 deaths.
+
+```{r}
+# Dot plot
+ggplot(china_deaths, aes(x = reorder(`Province/State`, total_deaths), y = total_deaths)) +
+    geom_point(
+        shape = 21,
+        fill = "red",
+        color = "red",
+        size = 2
+    ) +
+    labs(title = "Total COVID-19 Deaths by Provinces in China", 
+         x = "China Province",
+         y = "Total COVID-19 Deaths") +
+    coord_flip() +
+    theme_minimal() +
+    theme(
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_line(linetype = "dashed")
+    )
+```
+```{r}
+# Sort and show top 5 provinces with total COVID-19 deaths
+china_deaths %>%
+  arrange(desc(total_deaths)) %>%
+  head(5)
+```
+
+2. Which province in China has the most impressive COVID-19 recovery rate? Is there any reason for such a bounce back?
+
+While Hubei suffers from the most number of deaths, it does show a high recovery rate. Likewise, this pattern is found in Hong Kong. [A Hubei Reborn for New Glories; A China Embracing Openness and Prosperity](https://www.fmprc.gov.cn/mfa_eng/zxxx_662805/t1868494.shtml) explained how Hubei re-emerged and embraced openness and prosperity for new glories. "Every effort has been made to make up for the time lost, and to seize the opportunities to build capacity and shore up weak areas. The pandemic and post-COVID reopening have served as an opportunity to boost economic upgrading and transformation. From post-COVID recovery to steady economic and social development, and from winning a decisive victory over extreme poverty to fully building a moderately prosperous society, Hubei has again scored impressive achievements in the major test of rebuilding and reviving development."
+
+```{r}
+# Bar Plot with Reorder
+ggplot(china_recover, aes(reorder(`Province/State`, total_recovery), total_recovery)) +
+  geom_bar(stat="identity", fill="steelblue") +
+  theme_minimal() +
+  labs(title = "Total COVID-19 Recovery by Provinces in China", 
+         x = "China Province",
+         y = "Total COVID-19 Recovery") +
+  coord_flip()
+```
+```{r}
+# Sort and show top 5 provinces with total COVID-19 cases
+china_recover %>%
+  arrange(desc(total_recovery)) %>%
+  head(5)
+```
+
+3. How do COVID-19 cases evolve over time in different China provinces? What should policymakers do to address such issue?
+
+Date-time data can be frustrating to work with and I present this information by a heatmap of COVID-19 cases over time. Hubei still shows the most number of COVID-19 cases over time, followed by Hong Kong and Guangdong! 
+
+Learn how these 3 provinces come up with COVID-19 measures here:
+
+**Hubei**
+
+* [China’s Response to the COVID-19 Outbreak: A Model for Epidemic Preparedness and Management - FullText - Dubai Medical Journal 2020, Vol. 3, No. 2 - Karger Publishers](https://www.karger.com/Article/FullText/508448)
+* [Combined measures to control the COVID-19 pandemic in Wuhan, Hubei, China: A narrative review - ScienceDirect](https://www.sciencedirect.com/science/article/pii/S2588933820300200)
+
+**Hong Kong**
+
+* [COVID-19 Thematic Website - Together, We Fight the Virus - Inbound Travel](https://www.coronavirus.gov.hk/eng/inbound-travel.html)
+* [Hong Kong Social Distancing And Travel Rules For Covid-19: What You Can And Can’t Do | Tatler Hong Kong](https://hk.asiatatler.com/life/hong-kong-social-distancing-covid-19)
+* [COVID-19 Thematic Website - Together, We Fight the Virus - Home](https://www.coronavirus.gov.hk/eng/index.html)
+
+**Guangdong**
+
+* [China's Guangzhou covid cases rise as authorities tighten measures](https://www.cnbc.com/2021/06/09/china-guangzhou-covid-cases-rise-as-authorities-tighten-measures.html)
+* [China's Guangzhou city imposes more COVID-19 measures - CNA](https://www.channelnewsasia.com/news/asia/guangzhou-covid-19-more-measures-guangdong-china-14954456)
+* [China’s Guangdong tightens coronavirus measures as cases persist, East Asia News & Top Stories - The Straits Times](https://www.straitstimes.com/asia/east-asia/china-reports-24-new-covid-19-cases-cluster-grows-in-guangzhou)
+
+```{r}
+ggplot(china_cases_long, aes(x = year, y = `Province/State`, fill=total_cases)) +
+    geom_tile() +
+    geom_text(aes(year, `Province/State`, label=total_cases), color = "grey40", size = 3) +
+    scale_fill_gradient(low = "yellow", high = "red") +
+    labs(title = "Total COVID-19 Cases by Provinces in China From 2020 - 2021", 
+         x = "Year",
+         y = "China Province") +
+    theme_minimal() +
+    theme(axis.line = element_blank(),
+          axis.ticks = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank(),
+          legend.position="none")
+```
+```{r}
+# Sort and show top 5 provinces with total COVID-19 cases
+china_cases_long %>%
+  arrange(desc(total_cases)) %>%
+  head(5)
+```
+
+4. Can policymakers predict the number of COVID-19 deaths (t+1) in Hubei based on the historical data CSSE collected?
+
+Yes. In this question, I rely on Prophet, "a procedure for forecasting time series data based on an additive model where non-linear trends are fit with yearly, weekly, and daily seasonality, plus holiday effects. It works best with time series that have strong seasonal effects and several seasons of historical data. Prophet is robust to missing data and shifts in the trend, and typically handles outliers well. Prophet is open source software released by Facebook’s Core Data Science team. It is available for download on CRAN and PyPI." ([Prophet | Forecasting at scale.](https://facebook.github.io/prophet/))
+
+I predicted the COVID-19 deaths for the next year. The predicted value centers around 4,200 people on average as you can see from the below forecasting plot.
+
+```{r}
+# Call the prophet function to fit the model. 
+m <- prophet(china_deaths_ts, yearly.seasonality = TRUE, daily.seasonality = TRUE)
+
+# Takes the model object and a number of periods to forecast and produces a suitable dataframe. By default it will also include the historical dates so we can evaluate in-sample fit.
+future <- make_future_dataframe(m, periods = 365)
+forecast <- predict(m, future)
+tail(forecast[c('ds', 'yhat', 'yhat_lower', 'yhat_upper')])
+```
+```{r}
+# Plot the forecast
+plot(m, forecast)
+```
+
+## Step 4: Identify Bias
+
+As I am progressing in "Data Science as a Field" towards the end, I do not let myself fall into my personal judgement or biased experience, but I rather investigate data for the answer. I completely base my analysis on data. Hubei, Hong Kong, and Guangdong are the top 3 provinces with the most number of COVID-19 cases and deaths; however, there's a good sign of strong recovery rate likewise. Policymakers should look at this data with respect to the policies implemented in action if they positively affect the Chinese people. My finding agrees with the China's measures on the stringent measures to detain those who violate virus prevention measures and impose more restrictions on business and social activity, seeking to curb the spread of COVID-19 cases. This global pandemic is evolving and posing threats to the world, therefore policymakers need to learn the successful policies that work in other countries and apply to their country with caution, impartiality, and agility. 
+
+## Additional Resources
+
+* [Coronavirus Singapore - live map tracker from Microsoft Bing](https://www.bing.com/covid/local/singapore)
+* [See the latest data in your region - Johns Hopkins Coronavirus Resource Center](https://coronavirus.jhu.edu/region)
+* [COVID-19 Singapore Dashboard | UCA](https://co.vid19.sg/singapore/)
+* [JHU CSSE – Center For Systems Science and Engineering at JHU](https://systems.jhu.edu/)
+* [An interactive web-based dashboard to track COVID-19 in real time - The Lancet Infectious Diseases](https://www.thelancet.com/journals/laninf/article/PIIS1473-3099%2820%2930120-1/fulltext)
+* [A Hubei Reborn for New Glories; A China Embracing Openness and Prosperity](https://www.fmprc.gov.cn/mfa_eng/zxxx_662805/t1868494.shtml)
+* [ggplot US state and China province heatmap | Welcome to my blog](https://liuyanguu.github.io/post/2020/06/12/ggplot-us-state-and-china-province-heatmap/)
